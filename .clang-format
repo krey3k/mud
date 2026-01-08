@@ -1,0 +1,5 @@
+# Disabled at root, see file in source_files for MUD specific formatting rules
+DisableFormat: true
+
+# to format mud source files on windows run this in source/mud: for /r %t in (*.c *.h) do clang-format -i -style=file "%t"
+# for linux, something like this should work: find -iname *.c -or -iname *.h | xargs clang-format -i -style=file

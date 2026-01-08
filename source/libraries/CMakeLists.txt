@@ -1,0 +1,13 @@
+
+add_subdirectory(atomix)
+add_subdirectory(cjson)
+add_subdirectory(dr_libs)
+add_subdirectory(fs)
+add_subdirectory(minigamepad)
+add_subdirectory(mtlib)
+add_subdirectory(pocketpy)
+add_subdirectory(sokol)
+add_subdirectory(stb)
+add_subdirectory(stc)
+add_subdirectory(thread)
+add_subdirectory(tracy)

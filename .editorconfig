@@ -1,0 +1,5 @@
+root = true
+
+[source/mud/**/*.{c,h}]
+indent_style = space
+indent_size = 4

@@ -1,0 +1,43 @@
+##################################################
+# Setup Info
+##################################################
+# Set MUD_SANITIZE_THREADS cmake option
+# If you get an immediate fatal error on Linux about
+# "unexpected memory mapping", you may need to reduce
+# the vm.mmap_rnd_bits value via sysctl, like so:
+# sudo sysctl vm.mmap_rnd_bits=##
+# Usually values of 32 and above will cause this
+# issue. It is not recommended to make this persistent
+# for your system.
+# export TSAN_OPTIONS=suppressions=TSanSuppress.txt
+
+##################################################
+# Investigate: High Priority
+##################################################
+
+
+##################################################
+# Investigate: Low Priority
+##################################################
+
+# Various data races get triggered throughout the 
+# lifetime of the program on Linux, starting from 
+# the initialization of the program window. Unsure
+# if this can be addressed
+called_from_lib:libgallium*
+called_from_lib:libasound.so*
+
+# Usually triggered on shutdown on Linux; like
+# the above, not sure if they can be addressed
+deadlock:libdbus-1*
+deadlock:libX11*
+deadlock:libGLX*
+deadlock:libxcb*
+
+# Internal sokol_audio functions, not sure we can
+# do anything about it
+race:_saudio_*
+
+##################################################
+# Ignore
+##################################################

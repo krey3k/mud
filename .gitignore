@@ -1,0 +1,14 @@
+bin/*
+build/**/*
+*.exe
+*.pdb
+.vscode/settings.json
+!bin/assets/
+!bin/doomretro.wad
+.DS_Store
+web/preload/assets
+web/preload/*.wad
+web/preload/*.WAD
+web/site/*.js
+web/site/*.data
+web/site/*.wasm*

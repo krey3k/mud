@@ -1,0 +1,3 @@
+
+DoomRetro - https://github.com/bradharding/doomretro - c701ec0c85da1158771fe92a86075ddc8bc32e09
+sokol - https://github.com/floooh/sokol - 4f2386121c103eaf85960322872ea31c9120b85e

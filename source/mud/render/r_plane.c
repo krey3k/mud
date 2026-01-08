@@ -1,0 +1,777 @@
+/*
+==============================================================================
+
+                                 DOOM Retro
+           The classic, refined DOOM source port. For Windows PC.
+
+==============================================================================
+
+    Copyright © 1993-2025 by id Software LLC, a ZeniMax Media company.
+    Copyright © 2013-2025 by Brad Harding <mailto:brad@doomretro.com>.
+
+    This file is a part of DOOM Retro.
+
+    DOOM Retro is free software: you can redistribute it and/or modify it
+    under the terms of the GNU General Public License as published by the
+    Free Software Foundation, either version 3 of the license, or (at your
+    option) any later version.
+
+    DOOM Retro is distributed in the hope that it will be useful, but
+    WITHOUT ANY WARRANTY; without even the implied warranty of
+    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU
+    General Public License for more details.
+
+    You should have received a copy of the GNU General Public License
+    along with DOOM Retro. If not, see <https://www.gnu.org/licenses/>.
+
+    DOOM is a registered trademark of id Software LLC, a ZeniMax Media
+    company, in the US and/or other countries, and is used without
+    permission. All other trademarks are the property of their respective
+    holders. DOOM Retro is in no way affiliated with nor endorsed by
+    id Software.
+
+==============================================================================
+*/
+
+#include "console/c_cmds.h"
+#include "console/c_console.h"
+#include "doom/doomstat.h"
+#include "system/i_config.h"
+#include "system/i_system.h"
+#include "system/i_video.h"
+#include "menu/m_menu.h"
+#include "render/r_sky.h"
+#include "wad/w_wad.h"
+#include "mud_profiling.h"
+
+#define MAXVISPLANES 1024 // must be a power of 2
+
+// killough -- hash function for visplanes
+// Empirically verified to be fairly uniform:
+#define visplane_hash(picnum, lightlevel, height, colormap)                         \
+    ((unsigned int)((picnum) * 3 + (lightlevel) + (height) * 7 + (colormap) * 11) & \
+    (MAXVISPLANES - 1))
+
+static visplane_t* visplanes[MAXVISPLANES]; // killough
+static visplane_t* freetail;                // killough
+static visplane_t** freehead = &freetail;   // killough
+visplane_t* floorplane;
+visplane_t* ceilingplane;
+
+int* openings;
+int* lastopening; // dropoff overflow
+
+// Clip values are the solid pixel bounding the range.
+//  floorclip starts out render.screen_height
+//  ceilingclip starts out -1
+int* floorclip;   // dropoff overflow
+int* ceilingclip; // dropoff overflow
+
+// texture mapping
+static lighttable_t** planezlight;
+static fixed_t planeheight;
+
+static fixed_t xoffset, yoffset; // killough 02/28/98: flat offsets
+
+static angle_t rotation;
+
+static fixed_t angle_sin;
+static fixed_t angle_cos;
+static fixed_t viewx_trans;
+static fixed_t viewy_trans;
+
+fixed_t* yslope;
+fixed_t** yslopes;
+
+static fixed_t* cachedheight;
+
+// Static arrays used inside R_MapPlane - allocated dynamically
+static fixed_t* cacheddistance;
+static fixed_t* cachedanglecosdistance;
+static fixed_t* cachedanglesindistance;
+static fixed_t* cachedxstep;
+static fixed_t* cachedystep;
+static fixed_t* cachedangle;
+
+// Static array used inside R_MakeSpans
+static int* spanstart;
+
+static bool updateswirl;
+
+static angle_t* xtoskyangle;
+
+//
+// R_MapPlane
+//
+static void R_MapPlane(const int y, const int x1)
+{
+    TracyCZoneN(tracy_zone, "R_MapPlane", 1);
+    fixed_t anglecosdistance;
+    fixed_t anglesindistance;
+    int dx;
+
+    if(planeheight != cachedheight[y] || rotation != cachedangle[y])
+    {
+        // SoM: because r_centery is an actual row of pixels (and it isn't really the
+        // center row because there are an even number of rows) some corrections need
+        // to be made depending on where the row lies relative to the r_centery row.
+        const fixed_t dy =
+        (ABS(r_centery - y) << FRACBITS) + (y < r_centery ? -FRACUNIT : FRACUNIT) / 2;
+
+        cachedheight[y] = planeheight;
+        cachedangle[y]  = rotation;
+        ds_z = cacheddistance[y] = FixedMul(planeheight, yslope[y]);
+        anglecosdistance = cachedanglecosdistance[y] = FixedMul(angle_cos, ds_z);
+        anglesindistance = cachedanglesindistance[y] = FixedMul(angle_sin, ds_z);
+        ds_xstep = cachedxstep[y] = (fixed_t)((int64_t)angle_sin * planeheight / dy);
+        ds_ystep = cachedystep[y] = (fixed_t)((int64_t)angle_cos * planeheight / dy);
+    }
+    else
+    {
+        ds_z             = cacheddistance[y];
+        anglecosdistance = cachedanglecosdistance[y];
+        anglesindistance = cachedanglesindistance[y];
+        ds_xstep         = cachedxstep[y];
+        ds_ystep         = cachedystep[y];
+    }
+
+    dx       = x1 - r_centerx;
+    ds_xfrac = viewx_trans + anglecosdistance + dx * ds_xstep;
+    ds_yfrac = viewy_trans - anglesindistance + dx * ds_ystep;
+    ds_y     = y;
+    ds_x1    = x1;
+
+    if(fixedcolormap)
+    {
+        ds_colormap[0] = ds_colormap[1] = fixedcolormap;
+        altspanfunc();
+    }
+    else
+    {
+        ds_colormap[0] = planezlight[BETWEEN(0, ds_z >> LIGHTZSHIFT, MAXLIGHTZ - 1)];
+
+        if(r_ditheredlighting)
+        {
+            ds_colormap[1] =
+            planezlight[BETWEEN(0, (ds_z >> LIGHTZSHIFT) + 1, MAXLIGHTZ - 1)];
+
+            if(ds_colormap[0] == ds_colormap[1])
+                altspanfunc();
+            else
+            {
+                ds_z = ((ds_z >> 12) & 255);
+                spanfunc();
+            }
+        }
+        else
+            spanfunc();
+    }
+    TracyCZoneEnd(tracy_zone)
+}
+
+//
+// R_ClearPlanes
+// At beginning of frame.
+//
+void R_ClearPlanes(void)
+{
+    // opening/clipping determination
+    for(int i = 0; i < render.view_width; i++)
+    {
+        floorclip[i]   = render.view_height;
+        ceilingclip[i] = -1;
+    }
+
+    // [PN] Optimize loop by avoiding unnecessary assignments and checks.
+    // Only process non-null visplanes and simplify inner loop performance.
+    for(int i = 0; i < MAXVISPLANES; i++)
+        if(visplanes[i])
+        {
+            *freehead    = visplanes[i];
+            visplanes[i] = NULL;
+
+            while(*freehead)
+                freehead = &(*freehead)->next;
+        }
+
+    lastopening = openings;
+
+    // texture calculation
+    memset(cachedheight, 0, render.view_height * sizeof(*cachedheight));
+}
+
+// New function, by Lee Killough
+static visplane_t* new_visplane(const unsigned int hash)
+{
+    visplane_t* check = freetail;
+
+    if(!check)
+    {
+        check = calloc(1, sizeof(*check));
+        if(check)
+        {
+            // Allocate top and bottom arrays for this visplane
+            // Add +1 and offset pointer by 1 to allow sentinel access at index -1
+            // (R_MakeSpans accesses pl->top[pl->left - 1] which can be -1 when left is 0)
+            check->top = calloc(r_alloc_max_width + 1, sizeof(unsigned short));
+            check->bottom = calloc(r_alloc_max_width + 1, sizeof(unsigned short));
+            if(check->top)
+                check->top++;
+            if(check->bottom)
+                check->bottom++;
+        }
+    }
+    else if(!(freetail = freetail->next))
+        freehead = &freetail;
+
+    if(check)
+    {
+        check->next     = visplanes[hash];
+        visplanes[hash] = check;
+    }
+
+    return check;
+}
+
+//
+// R_FindPlane
+//
+visplane_t* R_FindPlane(fixed_t height,
+const int picnum,
+int lightlevel,
+const fixed_t x,
+const fixed_t y,
+const int colormap,
+const angle_t angle)
+{
+    TracyCZoneN(tracy_zone, "R_FindPlane", 1);
+
+    visplane_t* check;
+    unsigned int hash;
+
+    if(picnum == skyflatnum || (picnum & PL_SKYFLAT))
+    {
+        // killough 7/19/98: most skies map together
+        lightlevel = 0;
+
+        // haleyjd 05/06/08: but not all. If height > viewz, set height to 1
+        // instead of 0, to keep ceilings mapping with ceilings, and floors
+        // mapping with floors.
+        height = (height > viewz);
+    }
+
+    // New visplane algorithm uses hash table -- killough
+    hash = visplane_hash(picnum, lightlevel, height, colormap);
+
+    for(check = visplanes[hash]; check; check = check->next)
+        if(height == check->height && picnum == check->picnum &&
+        lightlevel == check->lightlevel && x == check->xoffset &&
+        y == check->yoffset && colormap == check->colormap && angle == check->angle)
+        {
+            TracyCZoneEnd(tracy_zone)
+            return check;
+        }
+
+    check = new_visplane(hash);
+
+    check->height     = height;
+    check->picnum     = picnum;
+    check->lightlevel = lightlevel;
+    check->xoffset    = x;
+    check->yoffset    = y;
+    check->left       = render.view_width;
+    check->right      = -1;
+    check->modified   = false;
+    check->colormap   = colormap;
+    check->angle      = angle;
+
+    memset(check->top, USHRT_MAX, render.view_width * sizeof(*check->top));
+
+    TracyCZoneEnd(tracy_zone)
+    return check;
+}
+
+//
+// R_DupPlane
+//
+visplane_t* R_DupPlane(const visplane_t* pl, const int start, const int stop)
+{
+    visplane_t* new_pl =
+    new_visplane(visplane_hash(pl->picnum, pl->lightlevel, pl->height, pl->colormap));
+
+    new_pl->height     = pl->height;
+    new_pl->picnum     = pl->picnum;
+    new_pl->lightlevel = pl->lightlevel;
+    new_pl->xoffset    = pl->xoffset;
+    new_pl->yoffset    = pl->yoffset;
+    new_pl->left       = start;
+    new_pl->right      = stop;
+    new_pl->modified   = false;
+    new_pl->colormap   = pl->colormap;
+    new_pl->angle      = pl->angle;
+
+    memset(new_pl->top, USHRT_MAX, render.view_width * sizeof(*new_pl->top));
+
+    return new_pl;
+}
+
+//
+// R_CheckPlane
+//
+visplane_t* R_CheckPlane(visplane_t* pl, const int start, const int stop)
+{
+    int intrl;
+    int intrh;
+    int unionl;
+    int unionh;
+    int x;
+
+    if(start < pl->left)
+    {
+        intrl  = pl->left;
+        unionl = start;
+    }
+    else
+    {
+        unionl = pl->left;
+        intrl  = start;
+    }
+
+    if(stop > pl->right)
+    {
+        intrh  = pl->right;
+        unionh = stop;
+    }
+    else
+    {
+        unionh = pl->right;
+        intrh  = stop;
+    }
+
+    for(x = intrl; x <= intrh && pl->top[x] == USHRT_MAX; x++)
+        ;
+
+    if(x > intrh)
+    {
+        pl->left  = unionl;
+        pl->right = unionh;
+        return pl;
+    }
+
+    // make a new visplane
+    return R_DupPlane(pl, start, stop);
+}
+
+//
+// R_MakeSpans
+//
+static void R_MakeSpans(visplane_t* pl)
+{
+    TracyCZoneN(tracy_zone, "R_MakeSpans", 1);
+    const int stop = pl->right + 1;
+
+    if(terraintypes[pl->picnum] >= LIQUID && r_liquid_current && !pl->xoffset &&
+    !pl->yoffset)
+    {
+        xoffset = animatedliquidxoffs;
+        yoffset = animatedliquidyoffs;
+    }
+    else
+    {
+        xoffset = pl->xoffset;
+        yoffset = pl->yoffset;
+    }
+
+    rotation  = pl->angle;
+    angle_sin = finesine[(viewangle + rotation) >> ANGLETOFINESHIFT];
+    angle_cos = finecosine[(viewangle + rotation) >> ANGLETOFINESHIFT];
+
+    if(!rotation)
+    {
+        viewx_trans = xoffset + viewx;
+        viewy_trans = yoffset - viewy;
+    }
+    else
+    {
+        const fixed_t sin = finesine[rotation >> ANGLETOFINESHIFT];
+        const fixed_t cos = finecosine[rotation >> ANGLETOFINESHIFT];
+
+        viewx_trans = FixedMul(viewx + xoffset, cos) - FixedMul(viewy - yoffset, sin);
+        viewy_trans = -(FixedMul(viewx + xoffset, sin) + FixedMul(viewy - yoffset, cos));
+    }
+
+    planeheight = ABS(pl->height - viewz);
+    planezlight =
+    zlight[BETWEEN(0, (pl->lightlevel >> LIGHTSEGSHIFT) + extralight, LIGHTLEVELS - 1)];
+    pl->top[pl->left - 1] = USHRT_MAX;
+    pl->top[stop]         = USHRT_MAX;
+
+    for(ds_x2 = pl->left; ds_x2 <= stop; ds_x2++)
+    {
+        unsigned int t1 = pl->top[ds_x2 - 1];
+        unsigned int b1 = pl->bottom[ds_x2 - 1];
+        unsigned int t2 = pl->top[ds_x2];
+        unsigned int b2 = pl->bottom[ds_x2];
+
+        for(; t1 < t2 && t1 <= b1; t1++)
+            R_MapPlane(t1, spanstart[t1]);
+
+        for(; b1 > b2 && b1 >= t1; b1--)
+            R_MapPlane(b1, spanstart[b1]);
+
+        while(t2 < t1 && t2 <= b2)
+            spanstart[t2++] = ds_x2;
+
+        while(b2 > b1 && b2 >= t2)
+            spanstart[b2--] = ds_x2;
+    }
+    TracyCZoneEnd(tracy_zone)
+}
+
+// Ripple Effect from SMMU (r_ripple.cpp) by Simon Howard
+#define SPEED 24
+
+// swirl factors determine the number of waves per flat width
+// 1 cycle per 64 units
+#define SWIRLFACTOR (FINEANGLES / 64)
+
+// 1 cycle per 32 units (2 in 64)
+#define SWIRLFACTOR2 (FINEANGLES / 32)
+
+static int offsets[1024 * 4096];
+
+//
+// R_InitDistortedFlats
+// [BH] Moved to separate function and called at startup
+//
+void R_InitDistortedFlats(void)
+{
+    for(int i = 0, *offset = offsets; i < 1024 * SPEED; i += SPEED, offset += 64 * 64)
+        for(int y = 0; y < 64; y++)
+            for(int x = 0; x < 64; x++)
+            {
+                int sinvalue, sinvalue2;
+                int x1, y1;
+
+                sinvalue = finesine[(y * SWIRLFACTOR + i * 5 + 900) & FINEMASK] * 2;
+                sinvalue2 = finesine[(x * SWIRLFACTOR2 + i * 4 + 300) & FINEMASK] * 2;
+                x1 = x + 128 + (sinvalue >> FRACBITS) + (sinvalue2 >> FRACBITS);
+                sinvalue = finesine[(x * SWIRLFACTOR + i * 3 + 700) & FINEMASK] * 2;
+                sinvalue2 = finesine[(y * SWIRLFACTOR2 + i * 4 + 1200) & FINEMASK] * 2;
+                y1 = y + 128 + (sinvalue >> FRACBITS) + (sinvalue2 >> FRACBITS);
+
+                offset[(y << 6) + x] = ((y1 & 63) << 6) + (x1 & 63);
+            }
+}
+
+//
+// R_DistortedFlat
+// Generates a distorted flat from a normal one using a two-dimensional sine
+// wave pattern. [crispy] Optimized to precalculate offsets
+//
+static byte* R_DistortedFlat(const int flatnum)
+{
+    static byte distortedflat[64 * 64];
+    static int prevflatnum = -1;
+    static int prevtic     = -1;
+    static byte* normalflat;
+    static int* offset = offsets;
+
+    if(prevtic != animatedtic && updateswirl)
+    {
+        offset  = &offsets[(animatedtic & 1023) << 12];
+        prevtic = animatedtic;
+
+        if(prevflatnum != flatnum)
+        {
+            normalflat  = lumpinfo[firstflat + flatnum]->cache;
+            prevflatnum = flatnum;
+        }
+
+        for(int i = 0; i < 64 * 64; i++)
+            distortedflat[i] = normalflat[offset[i]];
+    }
+    else if(prevflatnum != flatnum)
+    {
+        normalflat  = lumpinfo[firstflat + flatnum]->cache;
+        prevflatnum = flatnum;
+
+        for(int i = 0; i < 64 * 64; i++)
+            distortedflat[i] = normalflat[offset[i]];
+    }
+
+    return distortedflat;
+}
+
+static void DrawSkyTex(visplane_t* pl, skytex_t* skytex, void func(void))
+{
+    const int texture = R_TextureNumForName(skytex->name);
+    const angle_t angle = viewangle + (skytex->currx << (ANGLETOSKYSHIFT - FRACBITS));
+
+    dc_texturemid = (fixed_t)(skytex->mid * FRACUNIT) + skytex->curry;
+    dc_texheight  = textureheight[texture] >> FRACBITS;
+    dc_iscale     = FixedMul(skyiscale, skytex->scaley);
+
+    for(dc_x = pl->left; dc_x <= pl->right; dc_x++)
+        if((dc_yl = pl->top[dc_x]) != USHRT_MAX && dc_yl <= (dc_yh = pl->bottom[dc_x]))
+        {
+            dc_source = R_GetTextureColumn(R_CacheTextureCompositePatchNum(texture),
+            FixedMul((angle + xtoskyangle[dc_x]) >> ANGLETOSKYSHIFT, skytex->scalex));
+
+            func();
+        }
+}
+
+//
+// R_DrawPlanes
+// At the end of each frame.
+//
+void R_DrawPlanes(void)
+{
+    TracyCZoneN(tracy_zone, "R_DrawPlanes", 1);
+    xtoskyangle = (r_linearskies ? linearskyangle : xtoviewangle);
+
+    if(r_liquid_swirl)
+        updateswirl = !(consoleactive || helpscreen || paused || freeze);
+
+    dc_colormap[0] = (fixedcolormap && r_textures ? fixedcolormap : fullcolormap);
+
+    for(int i = 0; i < MAXVISPLANES; i++)
+        for(visplane_t* pl = visplanes[i]; pl; pl = pl->next)
+            if(pl->modified && pl->left <= pl->right)
+            {
+                const int picnum = pl->picnum;
+
+                ds_sectorcolormap = fullcolormap;
+
+                if(picnum == skyflatnum)
+                {
+                    dc_iscale = skyiscale;
+
+                    if(sky && (!vanilla || sky->type != SkyType_Fire))
+                    {
+                        id24compatible = true;
+
+                        if(sky->type == SkyType_Fire)
+                        {
+                            dc_texheight  = FIREHEIGHT;
+                            dc_texturemid = -28 * FRACUNIT;
+
+                            for(dc_x = pl->left; dc_x <= pl->right; dc_x++)
+                                if((dc_yl = pl->top[dc_x]) != USHRT_MAX &&
+                                dc_yl <= (dc_yh = pl->bottom[dc_x]))
+                                {
+                                    dc_source = R_GetFireColumn(
+                                    (viewangle + xtoskyangle[dc_x]) >> ANGLETOSKYSHIFT);
+
+                                    skycolfunc();
+                                }
+                        }
+                        else
+                        {
+                            DrawSkyTex(pl, &sky->skytex, skycolfunc);
+
+                            if(sky->type == SkyType_WithForeground)
+                                DrawSkyTex(pl, &sky->foreground, &R_DrawSkyColumn);
+                        }
+                    }
+                    else
+                    {
+                        // Normal DOOM sky, only one allowed per level
+                        const int texture = texturetranslation[skytexture];
+                        const rpatch_t* patch = R_CacheTextureCompositePatchNum(texture);
+
+                        dc_texheight  = textureheight[texture] >> FRACBITS;
+                        dc_texturemid = skytexturemid;
+
+                        for(dc_x = pl->left; dc_x <= pl->right; dc_x++)
+                            if((dc_yl = pl->top[dc_x]) != USHRT_MAX &&
+                            dc_yl <= (dc_yh = pl->bottom[dc_x]))
+                            {
+                                dc_source = R_GetTextureColumn(patch,
+                                (((viewangle + xtoskyangle[dc_x]) /
+                                 (1 << (ANGLETOSKYSHIFT - FRACBITS))) +
+                                skycolumnoffset) /
+                                FRACUNIT);
+
+                                skycolfunc();
+                            }
+                    }
+                }
+                else if((picnum & PL_FLATMAPPING) == PL_FLATMAPPING)
+                {
+                    const int texture = (picnum & ~PL_FLATMAPPING);
+                    const rpatch_t* patch = R_CacheTextureCompositePatchNum(texture);
+
+                    dc_iscale     = skyiscale;
+                    dc_texheight  = textureheight[texture] >> FRACBITS;
+                    dc_texturemid = skytexturemid;
+
+                    for(dc_x = pl->left; dc_x <= pl->right; dc_x++)
+                        if((dc_yl = pl->top[dc_x]) != USHRT_MAX &&
+                        dc_yl <= (dc_yh = pl->bottom[dc_x]))
+                        {
+                            dc_source = R_GetTextureColumn(patch,
+                            (((viewangle + xtoskyangle[dc_x]) /
+                             (1 << (ANGLETOSKYSHIFT - FRACBITS))) +
+                            skycolumnoffset) /
+                            FRACUNIT);
+
+                            R_DrawWallColumn();
+                        }
+                }
+                else if(picnum & PL_SKYFLAT)
+                {
+                    // killough 10/98: allow skies to come from sidedefs.
+                    // Allows scrolling and/or animated skies, as well as
+                    // arbitrary multiple skies per level without having
+                    // to use info lumps.
+
+                    // Sky linedef
+                    const line_t* line = lines + (picnum & ~PL_SKYFLAT);
+
+                    // Sky transferred from first sidedef
+                    const side_t* side = sides + *line->sidenum;
+
+                    if(side->missingtoptexture)
+                    {
+                        for(dc_x = pl->left; dc_x <= pl->right; dc_x++)
+                            if((dc_yl = pl->top[dc_x]) != USHRT_MAX &&
+                            dc_yl <= (dc_yh = pl->bottom[dc_x]))
+                                R_DrawSolidColorColumn();
+                    }
+                    else
+                    {
+                        // Texture comes from upper texture of reference sidedef
+                        const int texture = texturetranslation[side->toptexture];
+
+                        // Horizontal offset is turned into an angle offset,
+                        // to allow sky rotation as well as careful positioning.
+                        // However, the offset is scaled very small, so that it
+                        // allows a long-period of sky rotation.
+                        const angle_t angle = viewangle + side->textureoffset;
+
+                        angle_t flip = 0U;
+                        const rpatch_t* patch = R_CacheTextureCompositePatchNum(texture);
+
+                        dc_iscale = skyiscale;
+
+                        // Vertical offset allows careful sky positioning.
+                        dc_texturemid = side->rowoffset - 28 * FRACUNIT;
+
+                        dc_texheight = textureheight[texture] >> FRACBITS;
+
+                        if(canfreelook)
+                            dc_texturemid = dc_texturemid * dc_texheight / SKYSTRETCH_HEIGHT;
+
+                        // We sometimes flip the picture horizontally.
+
+                        // DOOM always flipped the picture, so we make it
+                        // optional, to make it easier to use the new feature,
+                        // while to still allow old sky textures to be used.
+                        if(line->special != TransferSkyTextureToTaggedSectors_Flipped)
+                            flip = ~0U;
+
+                        for(dc_x = pl->left; dc_x <= pl->right; dc_x++)
+                            if((dc_yl = pl->top[dc_x]) != USHRT_MAX &&
+                            dc_yl <= (dc_yh = pl->bottom[dc_x]))
+                            {
+                                dc_source = R_GetTextureColumn(patch,
+                                ((((angle + xtoskyangle[dc_x]) ^ flip) /
+                                 (1 << (ANGLETOSKYSHIFT - FRACBITS))) +
+                                skycolumnoffset) /
+                                FRACUNIT);
+
+                                skycolfunc();
+                            }
+                    }
+                }
+                else
+                {
+                    // regular flat
+                    ds_source = (terraintypes[picnum] >= LIQUID && r_liquid_swirl ?
+                    R_DistortedFlat(picnum) :
+                    lumpinfo[flattranslation[picnum]]->cache);
+                    ds_sectorcolormap =
+                    (pl->colormap && viewplayer->fixedcolormap != INVERSECOLORMAP ?
+                    colormaps[pl->colormap] :
+                    fullcolormap);
+
+                    R_MakeSpans(pl);
+                }
+            }
+    TracyCZoneEnd(tracy_zone)
+}
+
+// Track how many yslopes rows are currently allocated
+static int yslopes_alloc_count = 0;
+
+//
+// R_ResizePlaneBuffers
+// Allocates or reallocates plane rendering buffers for the current scale.
+// Called by R_ResizeRenderState when buffer sizes need to increase.
+//
+// Buffer sizes:
+//   openings: r_alloc_max_screen_area elements
+//   floorclip, ceilingclip: r_alloc_max_width elements
+//   cachedheight, cacheddistance, cached*: r_alloc_max_height elements
+//   yslopes: r_alloc_lookdirs x r_alloc_max_height 2D array
+//
+void R_ResizePlaneBuffers(void)
+{
+    // Free existing buffers
+    if(openings) free(openings);
+    if(floorclip) free(floorclip);
+    if(ceilingclip) free(ceilingclip);
+    if(cachedheight) free(cachedheight);
+    if(cacheddistance) free(cacheddistance);
+    if(cachedanglecosdistance) free(cachedanglecosdistance);
+    if(cachedanglesindistance) free(cachedanglesindistance);
+    if(cachedxstep) free(cachedxstep);
+    if(cachedystep) free(cachedystep);
+    if(cachedangle) free(cachedangle);
+    if(spanstart) free(spanstart);
+
+    // Free yslopes 2D array using the tracked allocation count
+    if(yslopes)
+    {
+        for(int i = 0; i < yslopes_alloc_count; i++)
+            if(yslopes[i]) free(yslopes[i]);
+        free(yslopes);
+        yslopes = NULL;
+        yslopes_alloc_count = 0;
+    }
+
+    // Allocate new buffers based on current allocation sizes
+    openings = calloc(r_alloc_max_screen_area, sizeof(int));
+    floorclip = calloc(r_alloc_max_width, sizeof(int));
+    ceilingclip = calloc(r_alloc_max_width, sizeof(int));
+    cachedheight = calloc(r_alloc_max_height, sizeof(fixed_t));
+    cacheddistance = calloc(r_alloc_max_height, sizeof(fixed_t));
+    cachedanglecosdistance = calloc(r_alloc_max_height, sizeof(fixed_t));
+    cachedanglesindistance = calloc(r_alloc_max_height, sizeof(fixed_t));
+    cachedxstep = calloc(r_alloc_max_height, sizeof(fixed_t));
+    cachedystep = calloc(r_alloc_max_height, sizeof(fixed_t));
+    cachedangle = calloc(r_alloc_max_height, sizeof(fixed_t));
+    spanstart = calloc(r_alloc_max_height, sizeof(int));
+
+    // Verify critical allocations succeeded
+    if(!openings || !floorclip || !ceilingclip ||
+       !cachedheight || !cacheddistance || !cachedanglecosdistance ||
+       !cachedanglesindistance || !cachedxstep || !cachedystep ||
+       !cachedangle || !spanstart)
+        I_Error("R_ResizePlaneBuffers: Failed to allocate plane buffers");
+
+    // Allocate yslopes 2D array and track the count
+    yslopes = calloc(r_alloc_lookdirs, sizeof(fixed_t*));
+    if(!yslopes)
+        I_Error("R_ResizePlaneBuffers: Failed to allocate yslopes array");
+
+    for(int i = 0; i < r_alloc_lookdirs; i++)
+    {
+        yslopes[i] = calloc(r_alloc_max_height, sizeof(fixed_t));
+        if(!yslopes[i])
+            I_Error("R_ResizePlaneBuffers: Failed to allocate yslopes[%d]", i);
+    }
+    yslopes_alloc_count = r_alloc_lookdirs;
+}

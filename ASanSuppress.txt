@@ -1,0 +1,31 @@
+##################################################
+# Setup Info
+##################################################
+# Set MUD_SANITIZE cmake option 
+# export ASAN_OPTIONS=detect_leaks=1
+# export LSAN_OPTIONS=suppressions=ASanSuppress.txt
+
+##################################################
+# Investigate: High Priority
+##################################################
+
+leak:mt_create
+leak:mt_resizePattern
+leak:mt_initReverb
+leak:C_Drawer
+leak:M_StringDuplicate
+leak:M_StringJoin
+leak:P_SpawnBloodSplat
+
+##################################################
+# Investigate: Low Priority
+##################################################
+
+
+##################################################
+# Ignore
+##################################################
+
+# This is one of the sokol_audio backends but beyond
+# the point where we can really do anything about it
+leak:libpipewire*
